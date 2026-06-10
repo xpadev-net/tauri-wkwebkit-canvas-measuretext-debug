@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Canvas 2D font matching differs between attached and detached canvases</title>
+  <style>
+    body { font-family: monospace; padding: 16px; background: #111; color: #eee; font-size: 12px; }
+    h2   { font-size: 14px; margin: 20px 0 4px; }
+    p    { margin: 4px 0 10px; color: #aaa; max-width: 900px; }
+    canvas { border: 1px solid #333; display: block; margin-bottom: 4px; background: #000; }
+    table { border-collapse: collapse; margin-bottom: 16px; }
+    th, td { border: 1px solid #444; padding: 3px 8px; text-align: right; white-space: nowrap; }
+    th, td:first-child { text-align: left; }
+    th { background: #222; }
+    .bad { color: #f66; font-weight: bold; }
+    .ok  { color: #6f6; }
+    #status { background: #1a1a1a; padding: 8px; margin: 12px 0; color: #fa0; line-height: 1.6; }
+    input { background: #222; color: #eee; border: 1px solid #555; padding: 3px 6px; font-family: monospace; }
+    button { background: #333; color: #eee; border: 1px solid #666; padding: 3px 10px; font-family: monospace; cursor: pointer; }
+    #dump { width: 100%; max-width: 900px; height: 140px; background: #1a1a1a; color: #ccc;
+            border: 1px solid #444; font-family: monospace; font-size: 11px; }
+  </style>
+</head>
+<body>
+
+<h2>Minimal repro — canvas 2D font matching depends on document attachment</h2>
+<p>
+  With a <b>user-installed font</b> (i.e. not part of the macOS system set — e.g. Google's
+  "Noto Sans JP" variable font placed in <code>~/Library/Fonts</code>, or a font bundled by an
+  application such as Microsoft Office's "YuGothic"), the identical
+  <code>ctx.font</code> string resolves to <b>different font faces</b> depending on whether the
+  canvas element is attached to the document. Both <code>measureText</code> and
+  <code>fillText</code> follow the mismatched face, so text measured on one kind of context and
+  painted/laid out via the other gets clipped. No warmup, transform, or drawing is required.
+</p>
+<p>
+  Every context is measured twice: with the target family, and with a <b>nonexistent family</b>
+  (<code>"NoSuchFont-Control-7f3a9", sans-serif</code>) as a per-context generic-fallback
+  baseline. This separates two distinct failure modes:
+  a <b>named-family visibility split</b> (the named family matches only on some contexts —
+  observed in WebKit) vs a <b>generic-fallback split</b> (even the nonexistent family measures
+  differently, i.e. generic resolution itself is context/language-dependent — observed in
+  Firefox). The <code>div[lang=ja]</code> / <code>div[lang=en]</code> and iframe rows probe
+  language inheritance as the driver of the latter.
+</p>
+<p>
+  To reproduce the WebKit issue, install a font that is not in the system set and enter its
+  family name below (default assumes Google "Noto Sans JP" in <code>~/Library/Fonts</code>).
+</p>
+
+<label>font-family: <input id="family" value="Noto Sans JP" size="30"></label>
+<button id="rerun">Re-run</button>
+
+<div id="status">Running…</div>
+
+<h2>1. Identical font string, different contexts</h2>
+<p>fontBoundingBoxAscent/Descent differing between rows proves a different face was resolved,
+   not just a different advance computation. "nx" columns use the nonexistent family —
+   they show what pure generic fallback measures on that context. A context where
+   width = nx width did not match the named family at all.</p>
+<table><thead><tr>
+  <th>context</th>
+  <th>width</th><th>fontBBAsc</th><th>fontBBDesc</th><th>Δw vs detached</th>
+  <th>nx width</th><th>nx fontBBAsc</th><th>Δnx vs detached</th>
+</tr></thead><tbody id="ctxBody"></tbody></table>
+
+<h2>2. Attach/detach toggling of one canvas object</h2>
+<p>Shows whether the matched face changes dynamically with connectedness, and whether the change
+   is synchronous or requires a frame.</p>
+<table><thead><tr><th>step</th><th>width</th><th>fontBBAscent</th></tr></thead><tbody id="toggleBody"></tbody></table>
+
+<h2>3. Visual proof — same fillText call</h2>
+<p>Top: painted on an attached canvas. Bottom: painted while detached, then blitted via drawImage.
+   With the bug present the two strips show visibly different glyphs and line lengths.</p>
+<canvas id="visAttached" width="1100" height="56"></canvas>
+<canvas id="visBlit"     width="1100" height="56"></canvas>
+
+<h2>Raw JSON</h2>
+<textarea id="dump" readonly onclick="this.select()">(pending)</textarea>
+
+<script>
+const TEXT      = '｢コメント増量(仮)｣っていうChrome拡張機能を使えば';
+const NX_FAMILY = 'NoSuchFont-Control-7f3a9';
+const $    = id => document.getElementById(id);
+const raf  = () => new Promise(r => requestAnimationFrame(r));
+const fmt  = v => (v === undefined || v === null) ? '—' : (+v).toFixed(3);
+const EPS  = 0.5;
+
+function metricsOf(ctx, font) {
+  ctx.font = font;
+  const m = ctx.measureText(TEXT);
+  return {
+    width: m.width,
+    fontAscent: m.fontBoundingBoxAscent,
+    fontDescent: m.fontBoundingBoxDescent,
+  };
+}
+
+let scratch = null;   // run-scoped container so re-runs don't accumulate nodes
+
+async function run() {
+  if (scratch) scratch.remove();
+  scratch = document.createElement('div');
+  scratch.style.cssText = 'position:absolute;left:-9999px;top:0';
+  document.body.appendChild(scratch);
+  $('ctxBody').innerHTML = '';
+  $('toggleBody').innerHTML = '';
+
+  const family = $('family').value.trim();
+  const FONT   = `600 20px "${family}", sans-serif`;
+  const NXFONT = `600 20px "${NX_FAMILY}", sans-serif`;
+  const R = {
+    env: {
+      ua: navigator.userAgent,
+      dpr: window.devicePixelRatio,
+      pageLang: document.documentElement.lang,
+      family, font: FONT, nxFont: NXFONT,
+      date: new Date().toISOString(),
+    },
+  };
+
+  // --- 1. context comparison ----------------------------------------------
+  // Create all DOM-dependent contexts first, then let them get composited.
+  const mkCanvas = () => {
+    const c = document.createElement('canvas');
+    c.width = 10; c.height = 10;
+    return c;
+  };
+
+  const attVisible = mkCanvas();
+  scratch.appendChild(attVisible);
+  const attHidden = mkCanvas();
+  attHidden.style.display = 'none';
+  scratch.appendChild(attHidden);
+
+  const divJa = document.createElement('div');
+  divJa.lang = 'ja';
+  const attJa = mkCanvas();
+  divJa.appendChild(attJa);
+  scratch.appendChild(divJa);
+
+  const divEn = document.createElement('div');
+  divEn.lang = 'en';
+  const attEn = mkCanvas();
+  divEn.appendChild(attEn);
+  scratch.appendChild(divEn);
+
+  const iframe = document.createElement('iframe');
+  iframe.style.cssText = 'width:10px;height:10px;visibility:hidden';
+  scratch.appendChild(iframe);
+  const iframeJa = document.createElement('iframe');
+  iframeJa.style.cssText = 'width:10px;height:10px;visibility:hidden';
+  scratch.appendChild(iframeJa);
+  await raf(); await raf();
+
+  const ifCanvas = iframe.contentDocument.createElement('canvas');
+  iframe.contentDocument.body.appendChild(ifCanvas);
+  iframeJa.contentDocument.documentElement.lang = 'ja';
+  const ifJaCanvas = iframeJa.contentDocument.createElement('canvas');
+  iframeJa.contentDocument.body.appendChild(ifJaCanvas);
+  await raf();
+
+  const rows = [
+    ['detached canvas', document.createElement('canvas').getContext('2d')],
+    ['attached canvas (visible)', attVisible.getContext('2d')],
+    ['attached canvas (display:none)', attHidden.getContext('2d')],
+    ['attached canvas in div[lang=ja]', attJa.getContext('2d')],
+    ['attached canvas in div[lang=en]', attEn.getContext('2d')],
+    ...(typeof OffscreenCanvas !== 'undefined'
+      ? [['OffscreenCanvas', new OffscreenCanvas(10, 10).getContext('2d')]] : []),
+    ['canvas in detached Document',
+      document.implementation.createHTMLDocument('').createElement('canvas').getContext('2d')],
+    ['canvas in same-origin iframe (no lang)', ifCanvas.getContext('2d')],
+    ['canvas in iframe with documentElement.lang=ja', ifJaCanvas.getContext('2d')],
+  ];
+
+  R.contexts = {};
+  let refW = null, refNx = null;
+  for (const [label, ctx] of rows) {
+    const m  = metricsOf(ctx, FONT);
+    const nx = metricsOf(ctx, NXFONT);
+    const entry = { ...m, nxWidth: nx.width, nxFontAscent: nx.fontAscent };
+    R.contexts[label] = entry;
+    if (refW === null) { refW = m.width; refNx = nx.width; }   // first row = detached
+    const dW  = m.width - refW;
+    const dNx = nx.width - refNx;
+    $('ctxBody').insertAdjacentHTML('beforeend', `<tr>
+      <td>${label}</td>
+      <td>${fmt(m.width)}</td><td>${fmt(m.fontAscent)}</td><td>${fmt(m.fontDescent)}</td>
+      <td class="${Math.abs(dW) > EPS ? 'bad' : 'ok'}">${dW > 0 ? '+' : ''}${fmt(dW)}</td>
+      <td>${fmt(nx.width)}</td><td>${fmt(nx.fontAscent)}</td>
+      <td class="${Math.abs(dNx) > EPS ? 'bad' : 'ok'}">${dNx > 0 ? '+' : ''}${fmt(dNx)}</td>
+    </tr>`);
+  }
+
+  // --- 2. attach/detach toggle ----------------------------------------------
+  R.toggle = [];
+  const c = mkCanvas();
+  const ctx = c.getContext('2d');
+  const tstep = (label) => {
+    const m = metricsOf(ctx, FONT);
+    R.toggle.push({ label, width: m.width, fontAscent: m.fontAscent });
+    $('toggleBody').insertAdjacentHTML('beforeend',
+      `<tr><td>${label}</td><td>${fmt(m.width)}</td><td>${fmt(m.fontAscent)}</td></tr>`);
+  };
+  tstep('detached (just created)');
+  scratch.appendChild(c);
+  tstep('appendChild — measured synchronously');
+  await raf();
+  tstep('appendChild + 1 rAF');
+  c.remove();
+  tstep('remove() — measured synchronously');
+  await raf();
+  tstep('remove() + 1 rAF');
+  scratch.appendChild(c);
+  await raf();
+  tstep('re-appended + 1 rAF');
+
+  // --- 3. visual proof --------------------------------------------------------
+  const VFONT = `600 36px "${family}", sans-serif`;
+  const va = $('visAttached').getContext('2d');
+  va.clearRect(0, 0, 1100, 56);
+  va.font = VFONT; va.fillStyle = '#fff'; va.textBaseline = 'middle';
+  va.fillText(TEXT, 4, 28);
+
+  const dc = document.createElement('canvas');
+  dc.width = 1100; dc.height = 56;
+  const dctx = dc.getContext('2d');
+  dctx.font = VFONT; dctx.fillStyle = '#fff'; dctx.textBaseline = 'middle';
+  dctx.fillText(TEXT, 4, 28);
+  const vb = $('visBlit').getContext('2d');
+  vb.clearRect(0, 0, 1100, 56);
+  vb.drawImage(dc, 0, 0);
+  R.visual = {
+    attached: metricsOf(va, VFONT).width,
+    detached: metricsOf(dctx, VFONT).width,
+  };
+
+  // --- verdict ------------------------------------------------------------------
+  const att = R.contexts['attached canvas (visible)'];
+  const det = R.contexts['detached canvas'];
+  const namedSplit   = Math.abs(att.width - det.width) > EPS;
+  const genericSplit = Math.abs(att.nxWidth - det.nxWidth) > EPS;
+  const attMatched   = Math.abs(att.width - att.nxWidth) > EPS;
+  const detMatched   = Math.abs(det.width - det.nxWidth) > EPS;
+
+  const lines = [];
+  if (genericSplit) {
+    lines.push(`⚠ GENERIC-FALLBACK SPLIT: the nonexistent family already measures differently ` +
+      `on attached (${fmt(att.nxWidth)}) vs detached (${fmt(det.nxWidth)}) — generic font ` +
+      `resolution itself is context-dependent (likely language inheritance; Firefox-style). ` +
+      `Named-family results are confounded by this — judge the lang rows first.`);
+  }
+  if (namedSplit) {
+    if (!genericSplit && attMatched && !detMatched) {
+      lines.push(`⚠ NAMED-FAMILY VISIBILITY SPLIT (WebKit-style): "${family}" matches on the ` +
+        `attached canvas (${fmt(att.width)} ≠ fallback ${fmt(att.nxWidth)}) but NOT on the ` +
+        `detached canvas (${fmt(det.width)} = fallback ${fmt(det.nxWidth)}).`);
+    } else if (!genericSplit && !attMatched && detMatched) {
+      lines.push(`⚠ NAMED-FAMILY VISIBILITY SPLIT (inverted): "${family}" matches on the ` +
+        `detached canvas but NOT on the attached one.`);
+    } else {
+      lines.push(`⚠ attached (${fmt(att.width)}) vs detached (${fmt(det.width)}) differ for ` +
+        `"${FONT}" (fontBBAscent ${fmt(att.fontAscent)} vs ${fmt(det.fontAscent)} ⇒ different faces).`);
+    }
+  }
+  if (!namedSplit && !genericSplit) {
+    lines.push(attMatched
+      ? `✓ No divergence — "${family}" resolved to the same face in all compared contexts.`
+      : `✓ No divergence — but "${family}" matched in NO context (all values equal the ` +
+        `fallback). Install the font or enter a different user-installed family.`);
+  }
+
+  const ja = R.contexts['attached canvas in div[lang=ja]'];
+  const en = R.contexts['attached canvas in div[lang=en]'];
+  if (ja && en && Math.abs(ja.nxWidth - en.nxWidth) > EPS) {
+    const detLike =
+      Math.abs(det.nxWidth - ja.nxWidth) <= EPS ? 'lang=ja' :
+      Math.abs(det.nxWidth - en.nxWidth) <= EPS ? 'lang=en' : 'neither';
+    lines.push(`ℹ Generic resolution is language-dependent: lang=ja → ${fmt(ja.nxWidth)}, ` +
+      `lang=en → ${fmt(en.nxWidth)}; the detached canvas resolves like ${detLike}.`);
+  }
+
+  const verdict = lines.join('\n');
+  $('status').textContent = verdict;
+  $('status').style.whiteSpace = 'pre-line';
+  $('status').style.color = verdict.includes('⚠') ? '#f66' : '#6f6';
+  R.verdict = lines;
+
+  $('dump').value = JSON.stringify(R, null, 1);
+}
+
+$('rerun').addEventListener('click', run);
+document.fonts.ready.then(run);
+</script>
+</body>
+</html>
